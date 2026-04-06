@@ -52,7 +52,7 @@ class RPN(nn.Module):
             position_H = torch.arange(0, H, 1)
             position_W = torch.arange(0, W, 1)
 
-            grid = torch.stack(torch.meshgrid(position_H, position_W), dim=-1)
+            grid = torch.stack(torch.meshgrid(position_H, position_W, indexing='ij'), dim=-1)
 
             # for each position: create N anchors
             anchors = []
@@ -167,8 +167,12 @@ class Faster_RCNN(nn.Module):
 
         if fixed_shape is None:
             self.fixed_shape = False
+            self.roi_pool = None
+            self.upscale_factor = None
         else:
             self.upscale_factor = fixed_shape[2]
+            self.roi_pool = ops.RoIAlign(output_size=(7, 7), spatial_scale=1 / self.upscale_factor[0], sampling_ratio=2, aligned=True)
+
         self.n_class = n_class
 
         bbox_normalize_stds = torch.tensor([0.1, 0.1, 0.2, 0.2])
@@ -176,29 +180,42 @@ class Faster_RCNN(nn.Module):
         self.rpn = RPN(in_channels, num_anchors, fixed_shape)
         self.rpn_objectness_sigmoid = nn.Sigmoid()
 
-        self.roi_pool = ops.RoIAlign(output_size=(7, 7), spatial_scale=1 / self.upscale_factor[0], sampling_ratio=2, aligned=True)
         self.detector = FastRCNN(in_channels, n_class, hidden_dim=1024, roi_output_size=(7, 7))
         self.detector_softmax = nn.Softmax(dim=-1)
 
-    def roi_and_forward_detector_training(self, batch_size, H, W, feature_map, proposals):
+
+    def ensure_parameters(self, upscale_factor):
+        if upscale_factor:
+            upscale_factor = upscale_factor
+            roi_pool = ops.RoIAlign(output_size=(7, 7), spatial_scale=1 / upscale_factor[0], sampling_ratio=2, aligned=True)
+        elif self.fixed_shape:
+            upscale_factor = self.upscale_factor
+            roi_pool = self.roi_pool
+        if not upscale_factor:
+            raise ValueError("Please provide the upscale factor (ratio image_shape/feature_map_shape) either in the constructor if the image shape is fixed or in the forward_train method if the image shape can vary")
+        return roi_pool, upscale_factor
+        
+
+    def roi_and_forward_detector_training(self, roi_pool, upscale_factor, batch_size, H, W, feature_map, proposals):
         # Clip the bounding box and transform h and w into x_max and y_max for torchvision ROI operation
         ROIs = []
         for image in range(batch_size):
-            ROIs.append(clip_bb_and_transform(proposals[image], H * self.upscale_factor[0], W * self.upscale_factor[1]).float())
+            ROIs.append(clip_bb_and_transform(proposals[image], H * upscale_factor[0], W * upscale_factor[1]).float())
 
         # ROI pooling : extract feature map block
-        pooled_features = self.roi_pool(feature_map.float(), ROIs)
+        pooled_features = roi_pool(feature_map.float(), ROIs)
 
         # Detector head part : classify the bounding boxes and refine them
         class_logits, bbox_deltas_map = self.detector.forward(pooled_features)
-
         return class_logits, bbox_deltas_map
 
 
-    def forward_train(self, feature_map, GT_BB, labels):
-        B, _, H, W = feature_map.shape
-        feature_map = input.permute(0, 3, 1, 2).contiguous() #shape : B, C, H, W for torch convolution layers and torchvision ops
+    def forward_train(self, feature_map, GT_BB, labels, upscale_factor=None):
 
+        roi_pool, upscale_factor = self.ensure_parameters(upscale_factor)
+
+        B, _, H, W = feature_map.shape
+        feature_map = feature_map.permute(0, 3, 1, 2).contiguous() #shape : B, C, H, W for torch convolution layers and torchvision ops
 
         # If the Ground Truth dataset is in (x_min, y_min, w, h) format, convert from xywh to yxhw for network compatibility
         if self.xywh_format:
@@ -209,12 +226,10 @@ class Faster_RCNN(nn.Module):
             GT_BB = torch.stack([GT_y, GT_x, GT_h, GT_w], dim=-1)
 
         # RPN part : create relevant proposals from the feature maps
-        preds = self.rpn.forward(feature_map, self.upscale_factor, train=True)
+        preds = self.rpn.forward(feature_map, upscale_factor, train=True)
         loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, xywh_format=self.xywh_format)
 
         # Proposal part:
-        # NEW METHOD
-        ####
         mixed_proposals = []
         aligned_GT_labels_list = []
         is_positive_list = []
@@ -235,7 +250,7 @@ class Faster_RCNN(nn.Module):
             is_positive_list.append(torch.zeros(num_neg, dtype=torch.bool, device=feature_map.device))
         
         # Run the detector
-        class_logits, mixed_bbox_deltas = self.roi_and_forward_detector_training(B, H, W, feature_map, proposals=mixed_proposals)
+        class_logits, mixed_bbox_deltas = self.roi_and_forward_detector_training(roi_pool, upscale_factor, B, H, W, feature_map, proposals=mixed_proposals)
         
         aligned_GT_labels = torch.cat(aligned_GT_labels_list, dim=0)
         is_positive_mask = torch.cat(is_positive_list, dim=0)
@@ -245,25 +260,6 @@ class Faster_RCNN(nn.Module):
 
         aligned_GT_BB = torch.cat(aligned_positive_proposals_GT_BB, dim=0)
         positive_proposals_concat = torch.cat(positive_proposals, dim=0)
-        ####
-
-        # OLD METHOD 
-        ####
-        # positive_class_probabilities, bbox_deltas_map = self.roi_and_forward_detector(B, H, W, feature_map, proposals=positive_proposals)
-        # negative_class_probabilities, _ = self.roi_and_forward_detector(B, H, W, feature_map, proposals=negative_proposals)
-        # class_logits = torch.cat((positive_class_logits, negative_class_logits), dim=0)
-        
-        # # Format the proposals for later use in the loss of the regression part of the detector
-        # positive_proposals_concat = torch.cat(positive_proposals, dim=0)
-        # negative_proposals_concat = torch.cat(negative_proposals, dim=0)
-
-        # # Format the labels to compute the loss of classification part of the detector
-        # aligned_GT_BB = torch.cat(aligned_positive_proposals_GT_BB, dim=0)
-        # aligned_positive_proposals_GT_labels = torch.cat(aligned_positive_proposals_GT_labels, dim=0)
-        # aligned_negative_proposals_GT_labels = torch.full((negative_proposals_concat.shape[0],), self.background_label_id, device=feature_map.device, dtype=torch.long) # all negative proposals are background class
-        # aligned_GT_labels = torch.cat((aligned_positive_proposals_GT_labels, aligned_negative_proposals_GT_labels), dim=0)
-        # ####
-
 
         # loss classification of detector (only positive proposals have a GT therefore no regression for negative proposals)
         if aligned_GT_labels.numel() == 0:
@@ -319,7 +315,7 @@ class Faster_RCNN(nn.Module):
         return loss#, final_anchors_boxes
     
 
-    def roi_and_forward_detector_inference(self, batch_size, h, w,feature_map, objectness_prob_map, proposals):
+    def roi_and_forward_detector_inference(self, roi_pool, upscale_factor, batch_size, h, w,feature_map, objectness_prob_map, proposals):
         # apply filters (objectness threshold, NMS, top-k boxes) to select only the best bounding boxes
         ROIs = []
 
@@ -336,7 +332,7 @@ class Faster_RCNN(nn.Module):
                 positive_proposals = positive_proposals[indices]
 
             # clip the bounding box and transform h and w into x_max and y_max for torchvision NMS and ROI operations
-            positive_proposals_formatted = clip_bb_and_transform(positive_proposals, h * self.upscale_factor[0], w * self.upscale_factor[1]).float()
+            positive_proposals_formatted = clip_bb_and_transform(positive_proposals, h * upscale_factor[0], w * upscale_factor[1]).float()
 
             #apply NMS and keep the 500 most relevants bounding boxes
             keep_indices = ops.nms(positive_proposals_formatted, positive_boxes_objectness_map, iou_threshold=0.7)[:500]
@@ -345,13 +341,14 @@ class Faster_RCNN(nn.Module):
             ROIs.append(positive_proposals_formatted)
 
         # ROI pooling : extract feature map block
-        pooled_features = self.roi_pool(feature_map, ROIs)
+        pooled_features = roi_pool(feature_map, ROIs)
 
         # detector part : classify the bounding boxes and refine them
         class_logits, bbox_deltas_map = self.detector.forward(pooled_features)
         class_probabilities = self.detector_softmax(class_logits)
         return class_probabilities, bbox_deltas_map, ROIs
     
+
     def adapt_proposals_format(self, proposals):
         """ Convert from (x_min, y_min, x_max, y_max) format to (center_y, center_x, h, w) format """
         x_min = proposals[:, 0]
@@ -364,23 +361,25 @@ class Faster_RCNN(nn.Module):
 
         cxp = x_min + 0.5 * w
         cyp = y_min + 0.5 * h
-
         return torch.stack([cyp, cxp, h, w], dim=-1)
 
-    def forward(self, feature_map):
-        B, H, W, _ = feature_map.shape
-        feature_map = input.permute(0, 3, 1, 2).contiguous()
 
+    def forward(self, feature_map, upscale_factor=None):
+
+        roi_pool, upscale_factor = self.ensure_parameters(upscale_factor)
+
+        B, H, W, _ = feature_map.shape
+        feature_map = feature_map.permute(0, 3, 1, 2).contiguous()
 
         # RPN part : create relevant bounding boxes from the feature maps
-        preds = self.rpn.forward(feature_map, self.upscale_factor, train=False)
+        preds = self.rpn.forward(feature_map, upscale_factor, train=False)
         objectness_logit_map, proposals, _, _ = preds
 
         # Transform logit score to probability score
         objectness_prob_map = self.rpn_objectness_sigmoid(objectness_logit_map)
 
         # Select the region of interest on the feature map (ROI) and forward the detector head to classify the proposals and compute deltas
-        class_probabilities, bbox_deltas_map, ROIs = self.roi_and_forward_detector_inference(B, H, W, feature_map, objectness_prob_map, proposals)
+        class_probabilities, bbox_deltas_map, ROIs = self.roi_and_forward_detector_inference(roi_pool, upscale_factor, B, H, W, feature_map, objectness_prob_map, proposals)
 
         # Track the most probable class for each proposal and the corresponding confidence score
         confidence_score, indice_class_selected = torch.max(class_probabilities, dim=-1)
@@ -431,7 +430,6 @@ class Faster_RCNN(nn.Module):
             final_boxes = torch.stack([pred_center_x, pred_center_y, pred_w, pred_h], dim=-1)
         else:
             final_boxes = torch.stack([pred_center_y, pred_center_x, pred_h, pred_w], dim=-1)
-
         return confidence_score, ROIs, final_boxes, indice_class_selected
 
 
