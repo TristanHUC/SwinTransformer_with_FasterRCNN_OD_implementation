@@ -61,7 +61,7 @@ class RPN(nn.Module):
                     shape_tensor = torch.tensor(shape)
                     length = torch.tensor(scale * shape_tensor)
 
-                    #shape : H, W, 4 : x_min, y_min, h, w
+                    #shape : H, W, 4 : y_min, x_min, h, w
                     anchors.append(torch.stack([
                         (grid[:, :, 0] * upscale_factor_H + upscale_factor_H // 2) - (length[0] // 2),
                         (grid[:, :, 1] * upscale_factor_W + upscale_factor_W // 2) - (length[1] // 2),
@@ -75,11 +75,11 @@ class RPN(nn.Module):
             height = H*upscale_factor_H
             width = W*upscale_factor_W
 
-            x_min, y_min, h, w = anchors[..., 0], anchors[..., 1], anchors[..., 2], anchors[..., 3]
-            x_max = x_min + h
-            y_max = y_min + w
+            y_min, x_min, h, w = anchors[..., 0], anchors[..., 1], anchors[..., 2], anchors[..., 3]
+            y_max = y_min + h
+            x_max = x_min + w
 
-            valid_mask = (x_min >= 0) & (y_min >= 0) & (x_max <= height) & (y_max <= width)
+            valid_mask = (x_min >= 0) & (y_min >= 0) & (y_max <= height) & (x_max <= width)
 
             return anchors.view(-1, 4), valid_mask.view(-1)
 
@@ -95,7 +95,7 @@ class RPN(nn.Module):
                 valid_mask = self.valid_mask
                 anchor_boxes = anchor_boxes[valid_mask]
             else :
-                valid_mask = torch.full([H * W * self.num_anchors], True, dtype=torch.bool)
+                valid_mask = torch.full([H * W * self.num_anchors], True, dtype=torch.bool, device=input.device)
         elif upscale_factor :
             if train == True :
                 anchor_boxes, valid_mask = self.create_anchors_boxes(H, W, upscale_factor)
@@ -103,8 +103,8 @@ class RPN(nn.Module):
             else :
                 anchor_boxes, _ = self.create_anchors_boxes(H, W, upscale_factor)
                 valid_mask = torch.full([H * W * self.num_anchors], True, dtype=torch.bool)
-            anchor_boxes = anchor_boxes.to(input.dtype)
-            valid_mask = valid_mask.to(input.dtype)
+            anchor_boxes = anchor_boxes.to(input.device)
+            valid_mask = valid_mask.to(input.device)
         else :
             raise NotImplementedError(" please provide the upscale factor (ratio image_shape/feature_map_shape)")
 
@@ -115,51 +115,52 @@ class RPN(nn.Module):
 
         # compute the objectness for each anchors and keep only the valid ones (valid == within the image range)
         objectness_list = self.rpn_objectness(x) # output shape: B, num_anchors, H, W
-        objectness_score_map = objectness_list.permute(0, 2, 3, 1).contiguous().view(B, -1)[:, valid_mask] # OK
+        objectness_score_map = objectness_list.permute(0, 2, 3, 1).contiguous().view(B, -1)[:, valid_mask]
 
         # compute the bounding boxes shifting values for each anchors and keep only the valid ones (valid == within the image range)
         bbox_list = self.rpn_bbox_pred(x) # output shape: B, num_anchors*4, H, W
-        box_deltas_map = bbox_list.permute(0, 2, 3, 1).contiguous().view(B, -1, 4)[:, valid_mask] # OK
+        box_deltas_map = bbox_list.permute(0, 2, 3, 1).contiguous().view(B, -1, 4)[:, valid_mask]
 
         # un-normalize the deltas, normalized during training
         box_deltas_map_unscaled = box_deltas_map * self.bbox_normalize_stds
 
-        anchor_x_min = anchor_boxes[..., 1]
         anchor_y_min = anchor_boxes[..., 0]
+        anchor_x_min = anchor_boxes[..., 1]
         anchor_h = anchor_boxes[..., 2]
         anchor_w = anchor_boxes[..., 3]
 
-        # Convert anchors to (center_x, center_y, w, h)
-        anchor_center_x = anchor_x_min + 0.5 * anchor_w
+        # Convert anchors to (center_y, center_x, h, w)
         anchor_center_y = anchor_y_min + 0.5 * anchor_h
+        anchor_center_x = anchor_x_min + 0.5 * anchor_w
 
         # The deltas predicted by the network
-        dx = box_deltas_map_unscaled[..., 0]
-        dy = box_deltas_map_unscaled[..., 1]
-        dw = box_deltas_map_unscaled[..., 2]
-        dh = box_deltas_map_unscaled[..., 3]
+        dy = box_deltas_map_unscaled[..., 0]
+        dx = box_deltas_map_unscaled[..., 1]
+        dh = box_deltas_map_unscaled[..., 2]
+        dw = box_deltas_map_unscaled[..., 3]
 
         # Apply the deltas to the anchor boxes
-        pred_center_x = dx * anchor_w + anchor_center_x
         pred_center_y = dy * anchor_h + anchor_center_y
-        pred_w = anchor_w * torch.exp(dw)
+        pred_center_x = dx * anchor_w + anchor_center_x
         pred_h = anchor_h * torch.exp(dh)
+        pred_w = anchor_w * torch.exp(dw)
 
         # Convert the refined boxes back to (x_min, y_min, w, h)
-        x_new = pred_center_x - 0.5 * pred_w
         y_new = pred_center_y - 0.5 * pred_h
-        refined_boxes = torch.stack([x_new, y_new, pred_w, pred_h], dim=-1)
+        x_new = pred_center_x - 0.5 * pred_w
+        proposals = torch.stack([y_new, x_new, pred_h, pred_w], dim=-1)
 
-        return objectness_score_map, refined_boxes, box_deltas_map_unscaled, anchor_boxes
+        return objectness_score_map, proposals, box_deltas_map, anchor_boxes
 
 
 class Faster_RCNN(nn.Module):
-    def __init__(self, in_channels: int, num_anchors: int, n_class: int, fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3):
+    def __init__(self, in_channels: int, num_anchors: int, n_class: int, fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False):
         super(Faster_RCNN, self).__init__()
 
         self.background_label_id = 0
         self.objectness_iou_threshold_positive_boxes = objectness_iou_threshold_positive_boxes
         self.objectness_iou_threshold_negative_boxes = objectness_iou_threshold_negative_boxes
+        self.xywh_format = xywh_format
 
         if fixed_shape is None:
             self.fixed_shape = False
@@ -172,11 +173,11 @@ class Faster_RCNN(nn.Module):
         self.rpn = RPN(in_channels, num_anchors, fixed_shape)
         self.rpn_objectness_sigmoid = nn.Sigmoid()
 
-        self.roi_pool = ops.RoIPool(output_size=(7, 7), spatial_scale=1 / self.upscale_factor[0])
+        self.roi_pool = ops.RoIAlign(output_size=(7, 7), spatial_scale=1 / self.upscale_factor[0], sampling_ratio=2, aligned=True)
         self.detector = FastRCNN(in_channels, n_class, hidden_dim=1024, roi_output_size=(7, 7))
         self.detector_softmax = nn.Softmax(dim=-1)
 
-    def roi_and_forward_detector(self, batch_size, H, W, feature_map, proposales):
+    def roi_and_forward_detector_training(self, batch_size, H, W, feature_map, proposales):
         # Clip the bounding box and transform h and w into x_max and y_max for torchvision ROI operation
         ROIs = []
         for image in range(batch_size):
@@ -191,12 +192,20 @@ class Faster_RCNN(nn.Module):
         return class_logits, bbox_deltas_map
 
 
-    def train(self, feature_map, GT_BB, labels):
+    def forward_train(self, feature_map, GT_BB, labels):
         B, H, W, _ = feature_map.shape
+
+        # If the Ground Truth dataset is in (x_min, y_min, w, h) format, convert from xywh to yxhw for network compatibility
+        if self.xywh_format:
+            GT_x = GT_BB[..., 0]
+            GT_y = GT_BB[..., 1]
+            GT_w = GT_BB[..., 2]
+            GT_h = GT_BB[..., 3]
+            GT_BB = torch.stack([GT_y, GT_x, GT_h, GT_w], dim=-1)
 
         # RPN part : create relevant proposals from the feature maps
         preds = self.rpn.forward(feature_map, self.upscale_factor, train=True)
-        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes)
+        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, xy_format=self.xy_format)
 
         # Proposal part:
         # NEW METHOD
@@ -221,7 +230,7 @@ class Faster_RCNN(nn.Module):
             is_positive_list.append(torch.zeros(num_neg, dtype=torch.bool, device=feature_map.device))
         
         # Run the detector
-        class_logits, mixed_bbox_deltas = self.roi_and_forward_detector(B, H, W, feature_map, proposals=mixed_proposals)
+        class_logits, mixed_bbox_deltas = self.roi_and_forward_detector_training(B, H, W, feature_map, proposals=mixed_proposals)
         
         aligned_GT_labels = torch.cat(aligned_GT_labels_list, dim=0)
         is_positive_mask = torch.cat(is_positive_list, dim=0)
@@ -263,20 +272,26 @@ class Faster_RCNN(nn.Module):
         loss_reg_fn = nn.SmoothL1Loss()
         if aligned_GT_BB.numel() > 0:
             # Calculate Target Deltas
-            p_x, p_y, p_w, p_h = positive_proposals_concat[:, 0], positive_proposals_concat[:, 1], positive_proposals_concat[
+            p_y, p_x, p_h, p_w = positive_proposals_concat[:, 0], positive_proposals_concat[:, 1], positive_proposals_concat[
                                                                                                    :,
                                                                                                    2], positive_proposals_concat[
                                                                                                        :, 3]
 
-            # Ground-truth boxes for these proposals (g_x, g_y, g_w, g_h)
-            g_x, g_y, g_w, g_h = aligned_GT_BB[:, 0], aligned_GT_BB[:, 1], aligned_GT_BB[:, 2], aligned_GT_BB[:, 3]
+            # Ground-truth boxes for these proposals (g_y, g_x, g_h, g_w)
+            g_y, g_x, g_h, g_w = aligned_GT_BB[:, 0], aligned_GT_BB[:, 1], aligned_GT_BB[:, 2], aligned_GT_BB[:, 3]
+
+            # Calculate the center coordinates for both proposals and GT boxes
+            p_center_y = p_y + 0.5 * p_h
+            p_center_x = p_x + 0.5 * p_w
+            g_center_y = g_y + 0.5 * g_h
+            g_center_x = g_x + 0.5 * g_w
 
             # Target delta formulas (same as RPN, but using proposals as anchors)
-            t_x = (g_x - p_x) / p_w
-            t_y = (g_y - p_y) / p_h
-            t_w = torch.log(g_w / p_w)
+            t_y = (g_center_y - p_center_y) / p_h
+            t_x = (g_center_x - p_center_x) / p_w
             t_h = torch.log(g_h / p_h)
-            target_deltas = torch.stack((t_x, t_y, t_w, t_h), dim=1)
+            t_w = torch.log(g_w / p_w)
+            target_deltas = torch.stack((t_y, t_x, t_h, t_w), dim=1)
 
             # scaled target deltas to smooth between coordinates and length => to avoid exploding deltas predictions
             # => need to scale back in inference
@@ -296,62 +311,33 @@ class Faster_RCNN(nn.Module):
         # final model loss
         loss = loss_rpn + loss_detector
 
-
-        # if we need to print the final anchors boxes :
-        printed_loss = """
-        # make select shifting values corresponding to the class predicted
-        #mask_corresponding_values = torch.arange(bbox_deltas_map.size(0), device=feature_map.device) * (self.n_class + 1) * 4 + 4 * aligned_GT_labels
-        #bbox_deltas_map = bbox_deltas_map.reshape(-1)
-        delta_x = bbox_deltas_map[mask_corresponding_values + 0]
-        delta_y = bbox_deltas_map[mask_corresponding_values + 1]
-        delta_h = bbox_deltas_map[mask_corresponding_values + 2]
-        delta_w = bbox_deltas_map[mask_corresponding_values + 3]
-        x_new = positive_predictions_concat[:, 2] * delta_x + positive_predictions_concat[:, 0]
-        y_new = positive_predictions_concat[:, 3] * delta_y + positive_predictions_concat[:, 1]
-        h_new = positive_predictions_concat[:, 2] * torch.exp(delta_h)
-        w_new = positive_predictions_concat[:, 3] * torch.exp(delta_w)
-        final_anchors_boxes = torch.stack([x_new, y_new, h_new, w_new], dim=-1)
-        #lengths = [len(final_anchors_boxes[i]) for i in range(B)]
-        #lengths.insert(0, 0)
-        """
-
         return loss#, final_anchors_boxes
+    
 
-    def forward(self, feature_map):
-
-        B, h, w, _ = feature_map.shape
-
-
-        # RPN part : create relevant bounding boxes from the feature maps
-        preds = self.rpn.forward(feature_map, self.upscale_factor, train=False)
-        objectness_logit_map, refined_boxes, _, _ = preds
-
-        # Transform logit score to probability score
-        objectness_prob_map = self.rpn_objectness_sigmoid(objectness_logit_map)
-
+    def roi_and_forward_detector_inference(self, batch_size, feature_map, objectness_prob_map, proposals):
         # apply filters (objectness threshold, NMS, top-k boxes) to select only the best bounding boxes
         ROIs = []
 
-        for image in range(B):
+        for image in range(batch_size):
 
             # only keep positive bounding boxes
             mask_positive_boxes = objectness_prob_map[image] > self.objectness_iou_threshold_positive_boxes                
             positive_boxes_objectness_map = objectness_prob_map[image][mask_positive_boxes]
-            positive_boxes_coordinates = refined_boxes[image][mask_positive_boxes]
+            positive_proposals = proposals[image][mask_positive_boxes]
 
             # Keep cutting if there are still too many boxes (for speed optimization)
             if positive_boxes_objectness_map.shape[0] > 2000:
                 positive_boxes_objectness_map, indices = torch.topk(positive_boxes_objectness_map, 2000)
-                positive_boxes_coordinates = positive_boxes_coordinates[indices]
+                positive_proposals = positive_proposals[indices]
 
             # clip the bounding box and transform h and w into x_max and y_max for torchvision NMS and ROI operations
-            positive_boxes_coordinates = clip_bb_and_transform(positive_boxes_coordinates, h * self.upscale_factor[0], w * self.upscale_factor[1]).float()
+            positive_proposals_formatted = clip_bb_and_transform(positive_proposals, h * self.upscale_factor[0], w * self.upscale_factor[1]).float()
 
             #apply NMS and keep the 500 most relevants bounding boxes
-            keep_indices = ops.nms(positive_boxes_coordinates, positive_boxes_objectness_map, iou_threshold=0.7)[:500]
-            positive_boxes_coordinates = positive_boxes_coordinates[keep_indices]
+            keep_indices = ops.nms(positive_proposals_formatted, positive_boxes_objectness_map, iou_threshold=0.7)[:500]
+            positive_proposals_formatted = positive_proposals_formatted[keep_indices]
 
-            ROIs.append(positive_boxes_coordinates)
+            ROIs.append(positive_proposals_formatted)
 
         # ROI pooling : extract feature map block
         pooled_features = self.roi_pool(feature_map, ROIs)
@@ -359,39 +345,44 @@ class Faster_RCNN(nn.Module):
         # detector part : classify the bounding boxes and refine them
         class_logits, bbox_deltas_map = self.detector.forward(pooled_features)
         class_probabilities = self.detector_softmax(class_logits)
+        return class_probabilities, bbox_deltas_map, ROIs
+    
+    def adapt_proposals_format(self, proposals):
+        """ Convert from (x_min, y_min, x_max, y_max) format to (center_y, center_x, h, w) format """
+        x_min = proposals[:, 0]
+        y_min = proposals[:, 1]
+        x_max = proposals[:, 2]
+        y_max = proposals[:, 3]
+
+        w = x_max - x_min
+        h = y_max - y_min
+
+        cxp = x_min + 0.5 * w
+        cyp = y_min + 0.5 * h
+
+        return torch.stack([cyp, cxp, h, w], dim=-1)
+
+    def forward(self, feature_map):
+
+        B = feature_map.shape[0]
+
+        # RPN part : create relevant bounding boxes from the feature maps
+        preds = self.rpn.forward(feature_map, self.upscale_factor, train=False)
+        objectness_logit_map, proposals, _, _ = preds
+
+        # Transform logit score to probability score
+        objectness_prob_map = self.rpn_objectness_sigmoid(objectness_logit_map)
+
+        # Select the region of interest on the feature map (ROI) and forward the detector head to classify the proposals and compute deltas
+        class_probabilities, bbox_deltas_map, ROIs = self.roi_and_forward_detector_inference(B, feature_map, objectness_prob_map, proposals)
+
+        # Track the most probable class for each proposal and the corresponding confidence score
         confidence_score, indice_class_selected = torch.max(class_probabilities, dim=-1)
 
-
-
-        ########################################################################
-        #anchors = torch.cat(ROIs, dim=0)
-
-        # make select shifting values corresponding to the class predicted
-        #mask_corresponding_values = torch.arange(bbox_deltas_map.size(0)) * (self.n_class + 1) * 4 + 4 * indice_class_selected
-        #bbox_deltas_map = bbox_deltas_map.reshape(-1,4)
-
-        # un-normalize the deltas, normalized during training
-        #box_deltas_map_unscaled = bbox_deltas_map * self.rpn.bbox_normalize_stds.to(bbox_deltas_map.device)
-        #box_deltas_map_unscaled.reshape(-1)
-
-
-
-        #delta_x = box_deltas_map_unscaled[mask_corresponding_values + 0]
-        #delta_y = box_deltas_map_unscaled[mask_corresponding_values + 1]
-        #delta_h = box_deltas_map_unscaled[mask_corresponding_values + 2]
-        #delta_w = box_deltas_map_unscaled[mask_corresponding_values + 3]
-
-        # compute bounding box shift (refinement of bounding boxes)
-        #x_new = anchors[:, 2] * delta_x + anchors[:, 0]
-        #y_new = anchors[:, 3] * delta_y + anchors[:, 1]
-        #h_new = anchors[:, 2] * torch.exp(delta_h)
-        #w_new = anchors[:, 3] * torch.exp(delta_w)
-
-        # reshape the prediction to output bounding box after RPN and detector per batch
-        #final_boxes = torch.stack([x_new, y_new, h_new, w_new], dim=-1)
-        #####################################################################################
-
-        proposal_boxes = torch.cat(ROIs, dim=0)
+        # Unformat the proposals to be able to apply the deltas to them and get the final refined bounding boxes.
+        # The proposals are in (x_min, y_min, x_max, y_max) format, we need to convert them to (center_y, center_x, h, w) format.
+        positive_proposals_formatted = torch.cat(ROIs, dim=0)
+        positive_proposals_centered = self.adapt_proposals_format(positive_proposals_formatted)
 
         # We want to Un-normalize by multiplying with the stds values
         # The predicted deltas have shape (num_proposals, (n_class + 1) * 4)
@@ -407,30 +398,28 @@ class Faster_RCNN(nn.Module):
         # Then use this indices along with the indice_class_selected to select the correct deltas for each proposal
         selected_deltas = unscaled_deltas_reshaped[proposal_indices, indice_class_selected]
 
-        # Apply the deltas to the proposal boxes to get the final refined boxes
-        # (This is the same logic as in the RPN, but using proposal_boxes instead of anchors)
-        # Make sure proposal_boxes are in (center_x, center_y, w, h) format for this calculation.
-        # If they are in (x_min, y_min, x_max, y_max), you need to convert them first.
+        # Retrieve the coordinates
+        cyp = positive_proposals_centered[:, 0]
+        cxp = positive_proposals_centered[:, 1]
+        hp = positive_proposals_centered[:, 2]
+        wp = positive_proposals_centered[:, 3]
 
-        # Assuming (center_x, center_y, w, h) format for proposal_boxes
-        xp = proposal_boxes[:, 0]
-        yp = proposal_boxes[:, 1]
-        wp = proposal_boxes[:, 2]
-        hp = proposal_boxes[:, 3]
-
-        dx = selected_deltas[:, 0]
-        dy = selected_deltas[:, 1]
-        dw = selected_deltas[:, 2]
-        dh = selected_deltas[:, 3]
+        dy = selected_deltas[:, 0]
+        dx = selected_deltas[:, 1]
+        dh = selected_deltas[:, 2]
+        dw = selected_deltas[:, 3]
 
         # Apply the delta transformations
-        pred_center_x = wp * dx + xp
-        pred_center_y = hp * dy + yp
-        pred_w = wp * torch.exp(dw)
+        pred_center_y = hp * dy + cyp
+        pred_center_x = wp * dx + cxp
         pred_h = hp * torch.exp(dh)
+        pred_w = wp * torch.exp(dw)
 
         # The final refined boxes (in center format)
-        final_boxes = torch.stack([pred_center_x, pred_center_y, pred_w, pred_h], dim=-1)
+        if self.xywh_format:
+            final_boxes = torch.stack([pred_center_x, pred_center_y, pred_w, pred_h], dim=-1)
+        else:
+            final_boxes = torch.stack([pred_center_y, pred_center_x, pred_h, pred_w], dim=-1)
 
         return confidence_score, ROIs, final_boxes, indice_class_selected
 

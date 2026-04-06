@@ -29,37 +29,41 @@ def initialize_weights(module):
         nn.init.constant_(module.bias, 0)
 
 def clip_bb_and_transform(bb, H, W):
+    """ 
+        Clip the bounding boxes to be within the image boundaries and transform them from (y_min, x_min, h, w) format to (x_min, y_min, x_max, y_max) format for torchvision operations.
+    """
 
-    x_min = bb[:, 0]
-    y_min = bb[:, 1]
-    x_max = x_min + bb[:, 2]
-    y_max = y_min + bb[:, 3]
+    y_min = bb[:, 0]
+    x_min = bb[:, 1]
+    y_max = x_min + bb[:, 2]
+    x_max = y_min + bb[:, 3]
 
     # Clip to image boundaries
-    x_min = torch.clamp(x_min, min=0, max=W)
     y_min = torch.clamp(y_min, min=0, max=H)
-    x_max = torch.clamp(x_max, min=0, max=W)
+    x_min = torch.clamp(x_min, min=0, max=W)
     y_max = torch.clamp(y_max, min=0, max=H)
+    x_max = torch.clamp(x_max, min=0, max=W)
 
     return torch.stack((x_min, y_min, x_max, y_max), dim=1)
 
 def IoU(box1, box2):
 
-    x1_min, y1_min = box1[..., 0], box1[..., 1]
-    x1_max, y1_max = x1_min + box1[..., 2], y1_min + box1[..., 3]
+    y1_min, x1_min = box1[..., 0], box1[..., 1]
+    y1_max, x1_max = y1_min + box1[..., 2], x1_min + box1[..., 3]
 
-    x2_min, y2_min = box2[..., 0], box2[..., 1]
-    x2_max, y2_max = x2_min + box2[..., 2], y2_min + box2[..., 3]
+    y2_min, x2_min = box2[..., 0], box2[..., 1]
+    y2_max, x2_max = y2_min + box2[..., 2], x2_min + box2[..., 3]
 
     # Compute intersection
-    x_min_inter = torch.maximum(x1_min, x2_min)
     y_min_inter = torch.maximum(y1_min, y2_min)
-    x_max_inter = torch.minimum(x1_max, x2_max)
+    x_min_inter = torch.maximum(x1_min, x2_min)
     y_max_inter = torch.minimum(y1_max, y2_max)
+    x_max_inter = torch.minimum(x1_max, x2_max)
+
 
     # Compute width and height of the intersection
-    inter_w = torch.clamp(x_max_inter - x_min_inter, min=0)
     inter_h = torch.clamp(y_max_inter - y_min_inter, min=0)
+    inter_w = torch.clamp(x_max_inter - x_min_inter, min=0)
 
     inter_area = inter_w * inter_h
 
@@ -93,15 +97,15 @@ def second_positive_anchors_condition(iou, device, mask, objectness_iou_threshol
     mask[1, indices_positive_boxes[:, 0].unique()] = iou_max_value_unique[:, 1]
     return mask
 
-def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_stds, objectness_iou_threshold_positive, objectness_iou_threshold_negative):
+def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_stds, objectness_iou_threshold_positive, objectness_iou_threshold_negative, xy_format: bool = False):
 
     device = preds[1].device
 
     # retrieve the predictions from RPN
-    objectness_score_map, refined_boxes, preds_delta, base_anchor_boxes  = preds
+    objectness_score_map, proposals, preds_delta, base_anchor_boxes  = preds
 
     # B => Batch size, BB => number of bounding boxes predicted
-    B, BB, _ = refined_boxes.shape
+    B, BB, _ = proposals.shape
 
     # for all images : compute positives anchors and losses
     loss = 0
@@ -166,18 +170,25 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
                 predicted_deltas_for_positives = preds_delta[i, mask_positive_anchors]
 
                 # Calculate the TARGET deltas (the ground truth for the regression)
-                xa, ya, wa, ha = selected_base_anchors[:, 0], selected_base_anchors[:, 1], selected_base_anchors[:,
+                ya, xa, ha, wa = selected_base_anchors[:, 0], selected_base_anchors[:, 1], selected_base_anchors[:,
                                                                                            2], selected_base_anchors[:,
                                                                                                3]
-                xg, yg, wg, hg = assigned_gt_boxes[:, 0], assigned_gt_boxes[:, 1], assigned_gt_boxes[:,
+                yg, xg, hg, wg = assigned_gt_boxes[:, 0], assigned_gt_boxes[:, 1], assigned_gt_boxes[:,
                                                                                    2], assigned_gt_boxes[:, 3]
+                
+                # Calculate the center coordinates for both anchors and GT boxes
+                cy_a = ya + 0.5 * ha
+                cx_a = xa + 0.5 * wa
+                cy_g = yg + 0.5 * hg
+                cx_g = xg + 0.5 * wg
+
 
                 # Target delta formulas from the paper
-                t_x = (xg - xa) / wa
-                t_y = (yg - ya) / ha
-                t_w = torch.log(wg / wa)
+                t_y = (cy_g - cy_a) / ha
+                t_x = (cx_g - cx_a) / wa
                 t_h = torch.log(hg / ha)
-                target_deltas = torch.stack((t_x, t_y, t_w, t_h), dim=1)
+                t_w = torch.log(wg / wa)
+                target_deltas = torch.stack((t_y, t_x, t_h, t_w), dim=1)
 
                 # scaled target deltas to smooth between coordinates and length => to avoid exploding deltas predictions
                 # => need to scale back in inference
@@ -190,10 +201,9 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
                 loss += loss_r
 
 
-            positive_proposals.append(refined_boxes[i][mask_positive_anchors])
-            negative_proposals.append(refined_boxes[i][mask_negative_anchors])
+            positive_proposals.append(proposals[i][mask_positive_anchors])
 
-            neg_boxes_tensor = refined_boxes[i][mask_negative_anchors]
+            neg_boxes_tensor = proposals[i][mask_negative_anchors]
             if neg_boxes_tensor.shape[0] > num_positive:
                 indices = torch.randperm(num_positive, device=device)
                 neg_boxes_tensor = neg_boxes_tensor[indices]
