@@ -85,7 +85,7 @@ class RPN(nn.Module):
 
 
     def forward(self, input, upscale_factor=None, train = False):
-        B, _,  H, W, _ = input.shape
+        B, _,  H, W = input.shape
 
         # If all inputs are of the same size : only compute reference anchors one time
         if self.fixed_shape:
