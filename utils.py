@@ -12,7 +12,7 @@ def focal_loss(inputs, targets, alpha=0.01, gamma=2.0):
     focal_term = (1 - pt) ** gamma
     loss = alpha_t * focal_term * BCE
 
-    return loss.sum()
+    return loss.mean()
 
 def initialize_weights(module):
 
@@ -35,8 +35,8 @@ def clip_bb_and_transform(bb, H, W):
 
     y_min = bb[:, 0]
     x_min = bb[:, 1]
-    y_max = x_min + bb[:, 2]
-    x_max = y_min + bb[:, 3]
+    y_max = y_min + bb[:, 2]
+    x_max = x_min + bb[:, 3]
 
     # Clip to image boundaries
     y_min = torch.clamp(y_min, min=0, max=H)
@@ -197,7 +197,7 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
                 # Compute the loss between predicted deltas and target deltas
                 # Normalize by number of anchors ~2400 in the paper, we use number of relevant anchors here for stability
                 loss_r = loss_reg(predicted_deltas_for_positives, target_deltas)
-                loss_r = 1.0 * (loss_r / num_positive)
+                loss_r = 1.0 * (loss_r / (num_positive * 2))
                 loss += loss_r
 
 

@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torchvision.ops as ops
-import torch.nn.functional as F
+import math
 from utils import loss_RPN, clip_bb_and_transform
 from Fast_RCNN import FastRCNN
 
@@ -85,8 +85,7 @@ class RPN(nn.Module):
 
 
     def forward(self, input, upscale_factor=None, train = False):
-        B, H, W, _ = input.shape
-        x = input.permute(0, 3, 1, 2).contiguous() #shape : B, C, H, W
+        B, _,  H, W, _ = input.shape
 
         # If all inputs are of the same size : only compute reference anchors one time
         if self.fixed_shape:
@@ -139,6 +138,10 @@ class RPN(nn.Module):
         dh = box_deltas_map_unscaled[..., 2]
         dw = box_deltas_map_unscaled[..., 3]
 
+        # Clamping dh and dw to prevent overflow
+        dh = torch.clamp(dh, max=math.log(1000. / 16.))
+        dw = torch.clamp(dw, max=math.log(1000. / 16.)) 
+
         # Apply the deltas to the anchor boxes
         pred_center_y = dy * anchor_h + anchor_center_y
         pred_center_x = dx * anchor_w + anchor_center_x
@@ -177,11 +180,11 @@ class Faster_RCNN(nn.Module):
         self.detector = FastRCNN(in_channels, n_class, hidden_dim=1024, roi_output_size=(7, 7))
         self.detector_softmax = nn.Softmax(dim=-1)
 
-    def roi_and_forward_detector_training(self, batch_size, H, W, feature_map, proposales):
+    def roi_and_forward_detector_training(self, batch_size, H, W, feature_map, proposals):
         # Clip the bounding box and transform h and w into x_max and y_max for torchvision ROI operation
         ROIs = []
         for image in range(batch_size):
-            ROIs.append(clip_bb_and_transform(proposales[image], H * self.upscale_factor[0], W * self.upscale_factor[1]).float())
+            ROIs.append(clip_bb_and_transform(proposals[image], H * self.upscale_factor[0], W * self.upscale_factor[1]).float())
 
         # ROI pooling : extract feature map block
         pooled_features = self.roi_pool(feature_map.float(), ROIs)
@@ -193,7 +196,9 @@ class Faster_RCNN(nn.Module):
 
 
     def forward_train(self, feature_map, GT_BB, labels):
-        B, H, W, _ = feature_map.shape
+        B, _, H, W = feature_map.shape
+        feature_map = input.permute(0, 3, 1, 2).contiguous() #shape : B, C, H, W for torch convolution layers and torchvision ops
+
 
         # If the Ground Truth dataset is in (x_min, y_min, w, h) format, convert from xywh to yxhw for network compatibility
         if self.xywh_format:
@@ -205,7 +210,7 @@ class Faster_RCNN(nn.Module):
 
         # RPN part : create relevant proposals from the feature maps
         preds = self.rpn.forward(feature_map, self.upscale_factor, train=True)
-        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, xy_format=self.xy_format)
+        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, xywh_format=self.xywh_format)
 
         # Proposal part:
         # NEW METHOD
@@ -262,7 +267,7 @@ class Faster_RCNN(nn.Module):
 
         # loss classification of detector (only positive proposals have a GT therefore no regression for negative proposals)
         if aligned_GT_labels.numel() == 0:
-            loss_detector = (class_logits * 0).sum() + 0.01 # The aim is to have ~0 loss and not retropropagate None gradient but 0
+            loss_detector = (class_logits * 0).sum() # The aim is to have ~0 loss and not retropropagate None gradient but 0
         else:
             loss_detector = nn.functional.cross_entropy(
                 class_logits, aligned_GT_labels.long()
@@ -314,7 +319,7 @@ class Faster_RCNN(nn.Module):
         return loss#, final_anchors_boxes
     
 
-    def roi_and_forward_detector_inference(self, batch_size, feature_map, objectness_prob_map, proposals):
+    def roi_and_forward_detector_inference(self, batch_size, h, w,feature_map, objectness_prob_map, proposals):
         # apply filters (objectness threshold, NMS, top-k boxes) to select only the best bounding boxes
         ROIs = []
 
@@ -363,8 +368,9 @@ class Faster_RCNN(nn.Module):
         return torch.stack([cyp, cxp, h, w], dim=-1)
 
     def forward(self, feature_map):
+        B, H, W, _ = feature_map.shape
+        feature_map = input.permute(0, 3, 1, 2).contiguous()
 
-        B = feature_map.shape[0]
 
         # RPN part : create relevant bounding boxes from the feature maps
         preds = self.rpn.forward(feature_map, self.upscale_factor, train=False)
@@ -374,7 +380,7 @@ class Faster_RCNN(nn.Module):
         objectness_prob_map = self.rpn_objectness_sigmoid(objectness_logit_map)
 
         # Select the region of interest on the feature map (ROI) and forward the detector head to classify the proposals and compute deltas
-        class_probabilities, bbox_deltas_map, ROIs = self.roi_and_forward_detector_inference(B, feature_map, objectness_prob_map, proposals)
+        class_probabilities, bbox_deltas_map, ROIs = self.roi_and_forward_detector_inference(B, H, W, feature_map, objectness_prob_map, proposals)
 
         # Track the most probable class for each proposal and the corresponding confidence score
         confidence_score, indice_class_selected = torch.max(class_probabilities, dim=-1)
@@ -412,6 +418,11 @@ class Faster_RCNN(nn.Module):
         # Apply the delta transformations
         pred_center_y = hp * dy + cyp
         pred_center_x = wp * dx + cxp
+
+        # Clamping dh and dw to prevent overflow
+        dh = torch.clamp(dh, max=math.log(1000. / 16.))
+        dw = torch.clamp(dw, max=math.log(1000. / 16.)) 
+
         pred_h = hp * torch.exp(dh)
         pred_w = wp * torch.exp(dw)
 
