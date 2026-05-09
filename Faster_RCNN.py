@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 from torch import nn
@@ -8,27 +8,23 @@ from utils import loss_RPN, clip_bb_and_transform
 from Fast_RCNN import FastRCNN
 
 class RPN(nn.Module):
-    def __init__(self, in_channels: int, num_anchors: int, bbox_normalize_stds: torch.Tensor, fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]]=None, scales=[43,86,126,172,256], shapes=[[1,1],[1,2],[2,1]]):
+    def __init__(self, in_channels: int, bbox_normalize_stds: torch.Tensor, scales: List[int], shapes: List[List[int]], fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]]=None):
         super(RPN, self).__init__()
 
         self.register_buffer("bbox_normalize_stds", bbox_normalize_stds)
 
-        self.num_anchors = num_anchors
         self.scales =  scales
         self.shapes = shapes
+        self.num_anchors = len(shapes) * len(scales)
 
         self.rpn_conv = nn.Conv2d(in_channels, 256, kernel_size=(3,3), stride=1, padding='same')
         #self.rpn_bn = nn.GroupNorm(num_groups=32, num_channels=256) #nn.BatchNorm2d(256)
         self.rpn_activation = nn.ReLU()
 
-        self.rpn_objectness = nn.Conv2d(256, num_anchors, kernel_size=(1,1), stride=1, padding='same')
+        self.rpn_objectness = nn.Conv2d(256, self.num_anchors, kernel_size=(1,1), stride=1, padding='same')
 
-        self.rpn_bbox_pred = nn.Conv2d(256, num_anchors * 4, kernel_size=(1,1), stride=1, padding='same')
+        self.rpn_bbox_pred = nn.Conv2d(256, self.num_anchors * 4, kernel_size=(1,1), stride=1, padding='same')
 
-        # Initialize weights
-        # for layer in [self.rpn_conv, self.rpn_objectness, self.rpn_bbox_pred]:
-        #     torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-        #     torch.nn.init.zeros_(layer.bias)
 
         # if the image shape will always be the same => compute the base anchors only once
         if fixed_shape :
@@ -157,10 +153,10 @@ class RPN(nn.Module):
 
 
 class Faster_RCNN(nn.Module):
-    def __init__(self, in_channels: int, num_anchors: int, n_class: int, fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False):
+    def __init__(self, in_channels: int, n_class: int, scales: List[int], shapes: List[List[int]],  fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False, background_label_id: int = 0):
         super(Faster_RCNN, self).__init__()
 
-        self.background_label_id = 0
+        self.background_label_id = background_label_id
         self.objectness_iou_threshold_positive_boxes = objectness_iou_threshold_positive_boxes
         self.objectness_iou_threshold_negative_boxes = objectness_iou_threshold_negative_boxes
         self.xywh_format = xywh_format
@@ -170,6 +166,7 @@ class Faster_RCNN(nn.Module):
             self.roi_pool = None
             self.upscale_factor = None
         else:
+            self.fixed_shape = True
             self.upscale_factor = fixed_shape[2]
             self.roi_pool = ops.RoIAlign(output_size=(7, 7), spatial_scale=1 / self.upscale_factor[0], sampling_ratio=2, aligned=True)
 
@@ -177,7 +174,12 @@ class Faster_RCNN(nn.Module):
 
         bbox_normalize_stds = torch.tensor([0.1, 0.1, 0.2, 0.2])
         self.register_buffer("bbox_normalize_stds", bbox_normalize_stds)
-        self.rpn = RPN(in_channels, num_anchors, fixed_shape)
+        self.rpn = RPN(
+            in_channels=in_channels,
+            bbox_normalize_stds=bbox_normalize_stds,
+            scales=scales,
+            shapes=shapes,
+            fixed_shape=fixed_shape)
         self.rpn_objectness_sigmoid = nn.Sigmoid()
 
         self.detector = FastRCNN(in_channels, n_class, hidden_dim=1024, roi_output_size=(7, 7))
@@ -227,7 +229,8 @@ class Faster_RCNN(nn.Module):
 
         # RPN part : create relevant proposals from the feature maps
         preds = self.rpn.forward(feature_map, upscale_factor, train=True)
-        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, xywh_format=self.xywh_format)
+        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes)
+        #print("overall RPN loss:", loss_rpn.item())
 
         # Proposal part:
         mixed_proposals = []
@@ -256,6 +259,7 @@ class Faster_RCNN(nn.Module):
         is_positive_mask = torch.cat(is_positive_list, dim=0)
 
         # Retrieve the bbox_deltas for positive proposals only using the boolean mask
+        aligned_GT_labels_pos = torch.cat(aligned_positive_proposals_GT_labels, dim=0)
         bbox_deltas_map = mixed_bbox_deltas[is_positive_mask]
 
         aligned_GT_BB = torch.cat(aligned_positive_proposals_GT_BB, dim=0)
@@ -302,16 +306,18 @@ class Faster_RCNN(nn.Module):
             indices_for_deltas = torch.arange(bbox_deltas_map.size(0), device=feature_map.device)
 
             # Select the deltas that correspond to the ground-truth class of each proposal
-            predicted_deltas = bbox_deltas_map.view(-1, self.n_class + 1, 4)[indices_for_deltas, aligned_positive_proposals_GT_labels]
+            predicted_deltas = bbox_deltas_map.view(-1, self.n_class + 1, 4)[indices_for_deltas, aligned_GT_labels_pos]
 
+            #print("detector class loss:", loss_detector.item())
             # Compute the loss between predicted and target deltas ---
             loss_reg_val = loss_reg_fn(predicted_deltas, target_deltas)
-            loss_detector += λ_reg * loss_reg_val
-
+            #print("Detector reg loss:", loss_reg_val.item())
+            loss_detector += loss_reg_val # λ_reg * loss_reg_val
 
         # final model loss
         loss = loss_rpn + loss_detector
 
+        #print("Final model loss:", loss.item())
         return loss#, final_anchors_boxes
     
 
@@ -335,7 +341,7 @@ class Faster_RCNN(nn.Module):
             positive_proposals_formatted = clip_bb_and_transform(positive_proposals, h * upscale_factor[0], w * upscale_factor[1]).float()
 
             #apply NMS and keep the 500 most relevants bounding boxes
-            keep_indices = ops.nms(positive_proposals_formatted, positive_boxes_objectness_map, iou_threshold=0.7)[:500]
+            keep_indices = ops.nms(positive_proposals_formatted, positive_boxes_objectness_map, iou_threshold=0.3)[:500]
             positive_proposals_formatted = positive_proposals_formatted[keep_indices]
 
             ROIs.append(positive_proposals_formatted)
@@ -425,12 +431,75 @@ class Faster_RCNN(nn.Module):
         pred_h = hp * torch.exp(dh)
         pred_w = wp * torch.exp(dw)
 
+        # shift back to (x_min, y_min)
+        x_new = pred_center_x - 0.5 * pred_w
+        y_new = pred_center_y - 0.5 * pred_h
+
         # The final refined boxes (in center format)
         if self.xywh_format:
-            final_boxes = torch.stack([pred_center_x, pred_center_y, pred_w, pred_h], dim=-1)
+            final_boxes = torch.stack([x_new, y_new, pred_w, pred_h], dim=-1)
         else:
-            final_boxes = torch.stack([pred_center_y, pred_center_x, pred_h, pred_w], dim=-1)
+            final_boxes = torch.stack([y_new, x_new, pred_h, pred_w], dim=-1)
+
         return confidence_score, ROIs, final_boxes, indice_class_selected
+    
+
+    @staticmethod
+    def postprocess_remove_low_confidence_boxes(confidence_score_threshold, confidence_score, ROIs, final_boxes, indice_class_selected):
+        """ Remove boxes with low confidence scores """
+
+        mask = confidence_score > confidence_score_threshold
+        confidence_score = confidence_score[mask]
+        final_boxes = final_boxes[mask]
+        indice_class_selected = indice_class_selected[mask]
+
+        new_ROIs = []
+        for ROI, mask in zip(ROIs, mask.split([len(ROI) for ROI in ROIs])):
+            new_ROIs.append(ROI[mask])
+
+        return confidence_score, new_ROIs, final_boxes, indice_class_selected
+    
+
+    @staticmethod
+    def postprocess_match_label(label, confidence_score, ROIs, final_boxes, indice_class_selected):
+        """ Keep bounding boxes corresponding to desired label """
+        mask = indice_class_selected == label
+        confidence_score = confidence_score[mask]
+        final_boxes = final_boxes[mask]
+        indice_class_selected = indice_class_selected[mask]
+
+        new_ROIs = []
+        for ROI, mask in zip(ROIs, mask.split([len(ROI) for ROI in ROIs])):
+            new_ROIs.append(ROI[mask])
+
+        return confidence_score, new_ROIs, final_boxes, indice_class_selected
+    
+    @staticmethod
+    def postprocess_exclude_label(label, confidence_score, ROIs, final_boxes, indice_class_selected):
+        """ Exclude bounding boxes corresponding to desired label """
+        mask = indice_class_selected == label
+        confidence_score = confidence_score[~mask]
+        final_boxes = final_boxes[~mask]
+        indice_class_selected = indice_class_selected[~mask]
+
+        new_ROIs = []
+        for ROI, mask in zip(ROIs, (~mask).split([len(ROI) for ROI in ROIs])):
+            new_ROIs.append(ROI[mask])
+
+        return confidence_score, new_ROIs, final_boxes, indice_class_selected
+    
+
+    @staticmethod
+    def postprocess_gather_by_image(confidence_score, ROIs, final_boxes, indice_class_selected):
+        """ Gather the predicted boxes and labels by image in the batch (instead of concatenated) """
+
+        split_sizes = [len(ROI) for ROI in ROIs]
+
+        pred_boxes = torch.split(final_boxes, split_sizes, dim=0)
+        labels = torch.split(indice_class_selected, split_sizes, dim=0)
+        confidence_scores = torch.split(confidence_score, split_sizes, dim=0)
+
+        return confidence_scores, pred_boxes, labels
 
 
 

@@ -14,19 +14,6 @@ def focal_loss(inputs, targets, alpha=0.01, gamma=2.0):
 
     return loss.mean()
 
-def initialize_weights(module):
-
-    if isinstance(module, nn.Conv2d):
-        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0)
-    elif isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight)
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0)
-    elif isinstance(module, nn.BatchNorm2d):
-        nn.init.constant_(module.weight, 1)
-        nn.init.constant_(module.bias, 0)
 
 def clip_bb_and_transform(bb, H, W):
     """ 
@@ -97,7 +84,7 @@ def second_positive_anchors_condition(iou, device, mask, objectness_iou_threshol
     mask[1, indices_positive_boxes[:, 0].unique()] = iou_max_value_unique[:, 1]
     return mask
 
-def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_stds, objectness_iou_threshold_positive, objectness_iou_threshold_negative, xy_format: bool = False):
+def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_stds, objectness_iou_threshold_positive, objectness_iou_threshold_negative):
 
     device = preds[1].device
 
@@ -131,27 +118,26 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
             mask = torch.full((2, BB), 0, device=device, dtype=torch.float32) # First row is the status of the anchor (negative, neutral, positive). Second row : the GT BB index for the positive anchors related to it
 
             # negative anchors condition
-            indices_negative_boxes = torch.argwhere(iou > objectness_iou_threshold_negative)[:, 0].unique()
-            mask[0,indices_negative_boxes] = 1
+            max_iou_per_anchor, _ = torch.max(iou, dim=1)
+            indices_negative_boxes = torch.argwhere(max_iou_per_anchor < objectness_iou_threshold_negative)[:, 0]
+            mask[0,indices_negative_boxes] = -1
 
             # second positive anchors condition: if IoU of predicted bounding box > objectness_iou_threshold_positive with any GT BB => positive and track with which GT BB has the max IoU 
             mask = second_positive_anchors_condition(iou, device, mask, objectness_iou_threshold = objectness_iou_threshold_positive)
 
             # first positive anchors condition: for each GT BB, the anchor with the highest IoU is positive
             indice_maxes = torch.argmax(iou, dim=0)
-            mask[0,indice_maxes] = 2
+            mask[0,indice_maxes] = 1
             mask[1, indice_maxes] = torch.arange(indice_maxes.shape[0], device=device, dtype=mask.dtype)
 
-
-            # positive : 1 and negative : -1 and neutral 0
-            mask[0,:] -= 1
 
             # compute RPN loss for each batch
             # first part : classification of anchor
             mask_relevant_anchors = mask[0,:] != 0
             relevant_anchors_objectness = objectness_score_map[i][mask_relevant_anchors]
             relevant_anchors_objectness_ground_truth = (mask[0,:][mask_relevant_anchors] + 1) / 2
-            loss += focal_loss(relevant_anchors_objectness, relevant_anchors_objectness_ground_truth)
+            loss += focal_loss(relevant_anchors_objectness, relevant_anchors_objectness_ground_truth) * 10
+            #print("RPN class loss:", loss.item())
 
             # Second part : Bounding box regression
             mask_positive_anchors = mask[0, :] == 1
@@ -197,7 +183,8 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
                 # Compute the loss between predicted deltas and target deltas
                 # Normalize by number of anchors ~2400 in the paper, we use number of relevant anchors here for stability
                 loss_r = loss_reg(predicted_deltas_for_positives, target_deltas)
-                loss_r = 1.0 * (loss_r / (num_positive * 2))
+                loss_r = 0.1 * (loss_r / (num_positive * 2))
+                #print("RPN reg loss:", loss_r.item())
                 loss += loss_r
 
 
@@ -205,7 +192,7 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
 
             neg_boxes_tensor = proposals[i][mask_negative_anchors]
             if neg_boxes_tensor.shape[0] > num_positive:
-                indices = torch.randperm(num_positive, device=device)
+                indices = torch.randperm(neg_boxes_tensor.shape[0], device=device)[:num_positive]
                 neg_boxes_tensor = neg_boxes_tensor[indices]
             negative_proposals.append(neg_boxes_tensor)
 

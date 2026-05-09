@@ -14,7 +14,7 @@ class PatchPartition(torch.nn.Module):
         super(PatchPartition, self).__init__()
         self.patch_size = patch_size
 
-        self.transform = torch.nn.Conv2d(in_channels, out_channels, kernel_size=(patch_size, patch_size), stride=patch_size, bias=False)
+        self.conv2d = torch.nn.Conv2d(in_channels, out_channels, kernel_size=(patch_size, patch_size), stride=patch_size, bias=False)
         self.layer_norm = torch.nn.LayerNorm(out_channels, eps=1e-4)
 
     def forward(self, image):
@@ -29,7 +29,7 @@ class PatchPartition(torch.nn.Module):
             added_pad_H = self.patch_size - (H % self.patch_size)
             added_pad_W = self.patch_size - (W % self.patch_size)
             image = F.pad(image, pad=(0, added_pad_W, 0, added_pad_H), mode='constant', value=0.0)
-        x = self.transform(image)
+        x = self.conv2d(image)
         x = x.permute(0, 2, 3, 1).contiguous()  
         x = self.layer_norm(x)
         return x
@@ -65,7 +65,6 @@ class SwinRelativePositionEmbedding(torch.nn.Module):
 
         # Formula to make each relative position unique going from 2 dimensions to 1.
         relative_coords[:, :, 0] *= 2 * window_size - 1
-        self.relative_position_index = relative_coords.sum(-1)
 
         self.register_buffer("relative_position_index", relative_coords.sum(-1))
 
@@ -78,7 +77,7 @@ class SwinRelativePositionEmbedding(torch.nn.Module):
 
 
 class SwinTransformerBlock(torch.nn.Module):
-    def __init__(self, window_size, n_heads, query_size=32, mask=None, dropout_rate=0.1, drop_path_rate=0.1):
+    def __init__(self, window_size, n_heads, query_size=32, mlp_factor=4, mask=None, dropout_rate=0.1, drop_path_rate=0.1):
         super(SwinTransformerBlock, self).__init__()
 
         self.in_channels = query_size*n_heads
@@ -106,9 +105,9 @@ class SwinTransformerBlock(torch.nn.Module):
         self.layer_norm_1 = torch.nn.LayerNorm(self.in_channels, eps=1e-4)
 
         # MLP part
-        self.fc1 = torch.nn.Linear(self.in_channels, 4 * self.in_channels)
+        self.fc1 = torch.nn.Linear(self.in_channels, mlp_factor * self.in_channels)
         self.activation = torch.nn.GELU()
-        self.fc2 = torch.nn.Linear(4 * self.in_channels, self.in_channels)
+        self.fc2 = torch.nn.Linear(mlp_factor * self.in_channels, self.in_channels)
         self.dropout = torch.nn.Dropout(dropout_rate)
 
         self.layer_norm_2 = torch.nn.LayerNorm(self.in_channels, eps=1e-4)
@@ -129,14 +128,14 @@ class SwinTransformerBlock(torch.nn.Module):
         _, H, W, _ = input.shape
         self.original_size = (H, W)
 
-        mask_padding = torch.full_like(input[0, :, 0], 0, dtype=torch.float, device=input.device)
+        mask_padding = torch.full_like(input[0, :, :, 0], 0, dtype=torch.float, device=input.device)
 
         # pad if necessary
         if H % self.window_size != 0 or W % self.window_size != 0:
             pad_h = (self.window_size - H % self.window_size) % self.window_size
             pad_w = (self.window_size - W % self.window_size) % self.window_size
-            input = F.pad(input, (0, 0, 0, pad_w, 0, pad_h), mode='constant', value=0.0, device=input.device)
-            mask_padding = F.pad(mask_padding, (0, pad_w, 0, pad_h), mode='constant', value=torch.tensor(float(-1000.0), dtype=torch.float, device=input.device))
+            input = F.pad(input, (0, 0, 0, pad_w, 0, pad_h), mode='constant', value=0.0)
+            mask_padding = F.pad(mask_padding, (0, pad_w, 0, pad_h), mode='constant', value=torch.tensor(float(-1000.0), dtype=torch.float))
 
         # roll if the window is shifted
         if self.use_shift:
@@ -182,7 +181,7 @@ class SwinTransformerBlock(torch.nn.Module):
         queries = queries.view(batch_size, nb_h_windows, nb_w_windows, self.window_size * self.window_size, self.n_heads, self.query_size)
         values = values.view(batch_size, nb_h_windows, nb_w_windows, self.window_size * self.window_size, self.n_heads, self.query_size)
 
-        #normalize Keys and Queries to compute cosine similarity | also
+        # normalize Keys and Queries to compute cosine similarity | also
         keys = keys / (keys.norm(dim=-1, keepdim=True) + 1e-6)
         queries = queries / (queries.norm(dim=-1, keepdim=True) + 1e-6)
 
@@ -205,7 +204,7 @@ class SwinTransformerBlock(torch.nn.Module):
 
         # finish the attention mecanism
         x = torch.einsum("...hwj, ...jhc -> ...whc", self.softmax(x), values) # output shape : batch_size, nb_h_windows, nb_w_windows, self.window_size*self.window_size, self.n_heads, self.query_size
-        x = x.view(batch_size, nb_h_windows, nb_w_windows, self.window_size*self.window_size, self.n_heads * self.query_size)
+        x = x.contiguous().view(batch_size, nb_h_windows, nb_w_windows, self.window_size*self.window_size, self.n_heads * self.query_size)
 
         # Concatenate heads into the in_channels dimension 
         x = self.output_proj(x) # output shape : batch_size, nb_h_windows, nb_w_windows, self.window_size*self.window_size, self.in_channels
@@ -269,7 +268,7 @@ class PatchMerging(torch.nn.Module):
 
 
 class SwinTransformer(torch.nn.Module):
-    def __init__(self, patch_size=4, patch_merging_ratio=2, in_channels=3, layers=[2,2,6,2], query_size=32, n_heads=[3, 6, 12, 24], window_size=7, dropout_rate=0.1, drop_path_rate=0.1):
+    def __init__(self, patch_size=4, patch_merging_ratio=2, in_channels=3, layers=[2,2,6,2], query_size=32, n_heads=[3, 6, 12, 24], mlp_factor=4, window_size=7, dropout_rate=0.1, drop_path_rate=0.1):
 
         super(SwinTransformer, self).__init__()
         self.window_size = window_size
@@ -288,7 +287,7 @@ class SwinTransformer(torch.nn.Module):
                     mask = self.masks
                 else :
                     mask = None
-                swin_blocks.append(SwinTransformerBlock(window_size=window_size, n_heads=n_heads[i], query_size=32, mask = mask, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate))
+                swin_blocks.append(SwinTransformerBlock(window_size=window_size, n_heads=n_heads[i], query_size=query_size, mlp_factor=mlp_factor, mask = mask, dropout_rate=dropout_rate, drop_path_rate=drop_path_rate))
 
             #add patch merging except for the last stage
             if i !=3 :
@@ -299,7 +298,7 @@ class SwinTransformer(torch.nn.Module):
 
         self.stages = torch.nn.ModuleList(self.stages)
 
-        self.final_layer_norm = torch.nn.LayerNorm(n_heads[-1] * query_size * patch_merging_ratio, eps=1e-4)
+        self.final_layer_norm = torch.nn.LayerNorm(n_heads[-1] * query_size, eps=1e-4)
 
     
     # masking non-related tokens
