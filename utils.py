@@ -95,6 +95,8 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
     B, BB, _ = proposals.shape
 
     # for all images : compute positives anchors and losses
+    loss_rpn_class = 0
+    loss_rpn_reg = 0
     loss = 0
     positive_proposals = []
     negative_proposals = []
@@ -136,8 +138,7 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
             mask_relevant_anchors = mask[0,:] != 0
             relevant_anchors_objectness = objectness_score_map[i][mask_relevant_anchors]
             relevant_anchors_objectness_ground_truth = (mask[0,:][mask_relevant_anchors] + 1) / 2
-            loss += focal_loss(relevant_anchors_objectness, relevant_anchors_objectness_ground_truth) * 10
-            #print("RPN class loss:", loss.item())
+            loss_rpn_class += focal_loss(relevant_anchors_objectness, relevant_anchors_objectness_ground_truth) * 10
 
             # Second part : Bounding box regression
             mask_positive_anchors = mask[0, :] == 1
@@ -183,9 +184,7 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
                 # Compute the loss between predicted deltas and target deltas
                 # Normalize by number of anchors ~2400 in the paper, we use number of relevant anchors here for stability
                 loss_r = loss_reg(predicted_deltas_for_positives, target_deltas)
-                loss_r = 0.1 * (loss_r / (num_positive * 2))
-                #print("RPN reg loss:", loss_r.item())
-                loss += loss_r
+                loss_rpn_reg += loss_r / (num_positive * 2)
 
 
             positive_proposals.append(proposals[i][mask_positive_anchors])
@@ -203,11 +202,14 @@ def loss_RPN(preds, GT_bounding_boxes, GT_class_probabilities, bbox_normalize_st
         else :
 
             GT_objectness_score_map = torch.zeros_like(objectness_score_map[i])
-            loss += focal_loss(objectness_score_map, GT_objectness_score_map)
+            loss += focal_loss(objectness_score_map, GT_objectness_score_map[i])
 
             positive_proposals.append(torch.empty((0, 4), device=device, dtype=torch.long))
             negative_proposals.append(torch.empty((0, 4), device=device, dtype=torch.long))
             aligned_positive_proposals_GT_BB.append(torch.empty((0, 4), device=device, dtype=torch.long))
             aligned_positive_proposals_GT_labels.append(torch.empty((0,), device=device, dtype=torch.long))
 
+    # print("RPN class loss:", loss_rpn_class.item())
+    # print("RPN reg loss:", loss_rpn_reg.item())
+    loss = loss_rpn_class + loss_rpn_reg
     return loss / B, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels

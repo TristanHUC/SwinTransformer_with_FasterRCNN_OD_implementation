@@ -9,6 +9,7 @@ class FastRCNN(nn.Module):
         self.fc1 = nn.Linear(input_dim * roi_output_size[0] * roi_output_size[1], hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
 
         self.cls_head = nn.Linear(hidden_dim, num_classes + 1) # +1 for background class
 
@@ -21,7 +22,9 @@ class FastRCNN(nn.Module):
 
         # fully connected layers
         x = self.relu(self.fc1(x))
+        x = self.dropout(x)
         x = self.relu(self.fc2(x))
+        x = self.dropout(x)
 
         # Classification head
         class_logits = self.cls_head(x)

@@ -25,6 +25,7 @@ class SwinTransformerDetection(torch.nn.Module):
                 head_objectness_iou_threshold_positive_boxes: float = 0.7,
                 head_objectness_iou_threshold_negative_boxes: float = 0.3,
                 head_xywh_format: bool = False,
+                head_hidden_dim: int = 4096,
                 n_classes: int = 2,
                 background_label_id: int = 0
                 ):
@@ -47,6 +48,7 @@ class SwinTransformerDetection(torch.nn.Module):
             head_objectness_iou_threshold_positive_boxes: In FasterRCNN, threshold to consider a positive anchors in training and threshold to keep a proposal in inference.
             head_objectness_iou_threshold_negative_boxes: In FasterRCNN, threshold to consider a negative anchors in training. Useless in inference.
             head_xywh_format: If set, the dataset ground truth values will be considered of format x_min, y_min, width, height. If not set, the dataset will be considered of format i, j, height, width. It also determined the format of the predicted bounding boxes.
+            head_hidden_dim: The hidden dimension for the detection head.
             n_classes: number of classes to predict.
             background_label_id: the class id for background 
         """
@@ -65,6 +67,7 @@ class SwinTransformerDetection(torch.nn.Module):
 
         self.OD_head = Faster_RCNN(
             in_channels=backbone_patch_merging_ratio * len(backbone_layers) * backbone_n_heads[0] * backbone_query_size,
+            hidden_dim=head_hidden_dim,
             n_class=n_classes,
             scales=head_scales,
             shapes=head_shapes,
@@ -78,12 +81,14 @@ class SwinTransformerDetection(torch.nn.Module):
         # load pretrained backbone weights otherwise initialize
         if backbone_weights_path:
             self.backbone.load_state_dict(torch.load(backbone_weights_path))
+            print(f"Backbone weights loaded from {backbone_weights_path}")
         else:
             self.backbone.apply(initialize_weights_Swin)
 
         # load pretrained head weights otherwise initialize
         if head_weights_path:
             self.OD_head.load_state_dict(torch.load(head_weights_path))
+            print(f"Head weights loaded from {head_weights_path}")
         else:
             self.OD_head.apply(initialize_weights_FasterRCNN)
 

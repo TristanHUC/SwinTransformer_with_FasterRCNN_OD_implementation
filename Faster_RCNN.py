@@ -153,7 +153,7 @@ class RPN(nn.Module):
 
 
 class Faster_RCNN(nn.Module):
-    def __init__(self, in_channels: int, n_class: int, scales: List[int], shapes: List[List[int]],  fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False, background_label_id: int = 0):
+    def __init__(self, in_channels: int, hidden_dim:int, n_class: int, scales: List[int], shapes: List[List[int]],  fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False, background_label_id: int = 0):
         super(Faster_RCNN, self).__init__()
 
         self.background_label_id = background_label_id
@@ -182,7 +182,7 @@ class Faster_RCNN(nn.Module):
             fixed_shape=fixed_shape)
         self.rpn_objectness_sigmoid = nn.Sigmoid()
 
-        self.detector = FastRCNN(in_channels, n_class, hidden_dim=1024, roi_output_size=(7, 7))
+        self.detector = FastRCNN(in_channels, n_class, hidden_dim=hidden_dim, roi_output_size=(7, 7))
         self.detector_softmax = nn.Softmax(dim=-1)
 
 
@@ -209,7 +209,7 @@ class Faster_RCNN(nn.Module):
 
         # Detector head part : classify the bounding boxes and refine them
         class_logits, bbox_deltas_map = self.detector.forward(pooled_features)
-        return class_logits, bbox_deltas_map
+        return class_logits, bbox_deltas_map, ROIs
 
 
     def forward_train(self, feature_map, GT_BB, labels, upscale_factor=None):
@@ -230,7 +230,6 @@ class Faster_RCNN(nn.Module):
         # RPN part : create relevant proposals from the feature maps
         preds = self.rpn.forward(feature_map, upscale_factor, train=True)
         loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes)
-        #print("overall RPN loss:", loss_rpn.item())
 
         # Proposal part:
         mixed_proposals = []
@@ -253,7 +252,7 @@ class Faster_RCNN(nn.Module):
             is_positive_list.append(torch.zeros(num_neg, dtype=torch.bool, device=feature_map.device))
         
         # Run the detector
-        class_logits, mixed_bbox_deltas = self.roi_and_forward_detector_training(roi_pool, upscale_factor, B, H, W, feature_map, proposals=mixed_proposals)
+        class_logits, mixed_bbox_deltas, ROIs = self.roi_and_forward_detector_training(roi_pool, upscale_factor, B, H, W, feature_map, proposals=mixed_proposals)
         
         aligned_GT_labels = torch.cat(aligned_GT_labels_list, dim=0)
         is_positive_mask = torch.cat(is_positive_list, dim=0)
@@ -311,14 +310,53 @@ class Faster_RCNN(nn.Module):
             #print("detector class loss:", loss_detector.item())
             # Compute the loss between predicted and target deltas ---
             loss_reg_val = loss_reg_fn(predicted_deltas, target_deltas)
-            #print("Detector reg loss:", loss_reg_val.item())
+            # print("Detector reg loss:", loss_reg_val.item())
             loss_detector += loss_reg_val # λ_reg * loss_reg_val
+
+            #############################################################""
+            split_sizes = [len(ROI) for ROI in ROIs]
+            mask_list = torch.split(is_positive_mask, split_sizes, dim=0)
+            pos_ROIs = []
+            for ROI, mask in zip(ROIs, mask_list):
+                pos_ROIs.append(ROI[mask])
+
+            class_logits = class_logits[is_positive_mask]
+            class_probabilities = self.detector_softmax(class_logits)
+            confidence_score, indice_class_selected = torch.max(class_probabilities, dim=-1)
+            
+            # Compute the final refined bounding boxes (not needed for training but useful for debugging)
+            predicted_deltas = predicted_deltas / self.bbox_normalize_stds
+            dy = predicted_deltas[:, 0]
+            dx = predicted_deltas[:, 1]
+            dh = predicted_deltas[:, 2]
+            dw = predicted_deltas[:, 3]
+
+            # Apply the delta transformations
+            pred_center_y = p_h * dy + p_y
+            pred_center_x = p_w * dx + p_x
+
+            # Clamping dh and dw to prevent overflow
+            dh = torch.clamp(dh, max=math.log(1000. / 16.))
+            dw = torch.clamp(dw, max=math.log(1000. / 16.)) 
+            
+            pred_h = p_h * torch.exp(dh)
+            pred_w = p_w * torch.exp(dw)
+
+            # shift back to (x_min, y_min)
+            x_new = pred_center_x - 0.5 * pred_w
+            y_new = pred_center_y - 0.5 * pred_h
+
+            # The final refined boxes (in center format)
+            if self.xywh_format:
+                final_boxes = torch.stack([x_new, y_new, pred_w, pred_h], dim=-1)
+            else:
+                final_boxes = torch.stack([y_new, x_new, pred_h, pred_w], dim=-1)
 
         # final model loss
         loss = loss_rpn + loss_detector
 
         #print("Final model loss:", loss.item())
-        return loss#, final_anchors_boxes
+        return loss, confidence_score, pos_ROIs, final_boxes, indice_class_selected
     
 
     def roi_and_forward_detector_inference(self, roi_pool, upscale_factor, batch_size, h, w,feature_map, objectness_prob_map, proposals):
