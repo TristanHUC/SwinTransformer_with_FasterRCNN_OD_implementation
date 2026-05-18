@@ -1,4 +1,5 @@
 import torch.nn as nn
+import math
 
 from Swin_V2 import PatchPartition, SwinTransformerBlock, PatchMerging
 from Faster_RCNN import RPN
@@ -47,17 +48,20 @@ def initialize_weights_Swin(module):
 
 
 def initialize_weights_FasterRCNN(module):
+    pi = 0.33 # with downsampling, the positive/negative ratio is around 1:3
+
     # RPN initialization
     if isinstance(module, RPN):
         nn.init.kaiming_normal_(module.rpn_conv.weight, mode='fan_in', nonlinearity='relu')
         if module.rpn_conv.bias is not None:
             nn.init.constant_(module.rpn_conv.bias, 0)
-        nn.init.xavier_uniform_(module.rpn_objectness.weight)
+        nn.init.normal_(module.rpn_objectness.weight, std=0.01)
         if module.rpn_objectness.bias is not None:
-            nn.init.constant_(module.rpn_objectness.bias, 0)
-        nn.init.xavier_uniform_(module.rpn_bbox_pred.weight)
+            nn.init.constant_(module.rpn_objectness.bias, -math.log((1 - pi) / pi))
+        nn.init.normal_(module.rpn_bbox_pred.weight, std=0.01)
         if module.rpn_bbox_pred.bias is not None:
             nn.init.constant_(module.rpn_bbox_pred.bias, 0)
+
 
     # FastRCNN initialization
     elif isinstance(module, FastRCNN):
@@ -67,9 +71,9 @@ def initialize_weights_FasterRCNN(module):
         nn.init.kaiming_normal_(module.fc2.weight, mode='fan_in', nonlinearity='relu')
         if module.fc2.bias is not None:
             nn.init.constant_(module.fc2.bias, 0)
-        nn.init.xavier_uniform_(module.cls_head.weight)
+        nn.init.normal_(module.cls_head.weight, std=0.01)
         if module.cls_head.bias is not None:
             nn.init.constant_(module.cls_head.bias, 0)
-        nn.init.xavier_uniform_(module.bbox_head.weight)
+        nn.init.normal_(module.bbox_head.weight, std=0.01)
         if module.bbox_head.bias is not None:
             nn.init.constant_(module.bbox_head.bias, 0)

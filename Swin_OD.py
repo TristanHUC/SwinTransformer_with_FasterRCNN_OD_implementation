@@ -92,10 +92,10 @@ class SwinTransformerDetection(torch.nn.Module):
         else:
             self.OD_head.apply(initialize_weights_FasterRCNN)
 
-    def forward_train(self, input, BoundingBoxes, labels):
+    def forward_train(self, input, BoundingBoxes, labels, rpn_training_only:bool=False, λ_detector_reg = 10, λ_rpn_reg = 0.25):
 
         x = self.backbone(input)
-        return self.OD_head.forward_train(x, BoundingBoxes, labels)
+        return self.OD_head.forward_train(x, BoundingBoxes, labels, rpn_training_only=rpn_training_only, λ_detector_reg = λ_detector_reg, λ_rpn_reg = λ_rpn_reg)
 
     def forward(self, input):
 
