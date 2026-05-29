@@ -9,7 +9,7 @@ class FastRCNN(nn.Module):
         self.fc1 = nn.Linear(input_dim * roi_output_size[0] * roi_output_size[1], hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.7)
+        self.dropout = nn.Dropout(0.5)
 
         self.cls_head = nn.Linear(hidden_dim, num_classes + 1) # +1 for background class
 
