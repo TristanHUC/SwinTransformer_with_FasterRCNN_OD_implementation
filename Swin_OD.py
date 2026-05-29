@@ -3,13 +3,15 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 from Swin_V2 import SwinTransformer
-from init_weights import initialize_weights_Swin, initialize_weights_FasterRCNN
+from init_weights import initialize_weights_Swin, initialize_weights_FasterRCNN_detector, initialize_weights_FasterRCNN_rpn
 from Faster_RCNN import Faster_RCNN
 
 
 class SwinTransformerDetection(torch.nn.Module):
     def __init__(self, 
                 backbone_weights_path: Path = None,
+                head_rpn_weight_path: Path = None,
+                head_detector_weight_path: Path = None,
                 backbone_patch_size: int = 4,
                 backbone_patch_merging_ratio: int = 2,
                 backbone_in_channels: int = 3,
@@ -24,6 +26,7 @@ class SwinTransformerDetection(torch.nn.Module):
                 head_fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = [16, 16, [512 / 16, 512 / 16]],
                 head_objectness_iou_threshold_positive_boxes: float = 0.7,
                 head_objectness_iou_threshold_negative_boxes: float = 0.3,
+                head_detector_background_iou_threshold_background: float = 0.5,
                 head_xywh_format: bool = False,
                 head_hidden_dim: int = 4096,
                 n_classes: int = 2,
@@ -47,6 +50,7 @@ class SwinTransformerDetection(torch.nn.Module):
             head_fixed_shape: In FasterRCNN, it's the size of the feature maps given to the head and the ratio to retrieve the RoI in the original image. If set we compute anchors once and apply them for each input. If not set, it must be given for each input.
             head_objectness_iou_threshold_positive_boxes: In FasterRCNN, threshold to consider a positive anchors in training and threshold to keep a proposal in inference.
             head_objectness_iou_threshold_negative_boxes: In FasterRCNN, threshold to consider a negative anchors in training. Useless in inference.
+            head_detector_background_iou_threshold_background: In FasterRCNN, threshold to consider a proposal as background for the detector part during training. Useless in inference.
             head_xywh_format: If set, the dataset ground truth values will be considered of format x_min, y_min, width, height. If not set, the dataset will be considered of format i, j, height, width. It also determined the format of the predicted bounding boxes.
             head_hidden_dim: The hidden dimension for the detection head.
             n_classes: number of classes to predict.
@@ -72,8 +76,9 @@ class SwinTransformerDetection(torch.nn.Module):
             scales=head_scales,
             shapes=head_shapes,
             fixed_shape=head_fixed_shape,
-            objectness_iou_threshold_positive_boxes=head_objectness_iou_threshold_positive_boxes,
-            objectness_iou_threshold_negative_boxes=head_objectness_iou_threshold_negative_boxes,
+            rpn_objectness_iou_threshold_positive_boxes=head_objectness_iou_threshold_positive_boxes,
+            rpn_objectness_iou_threshold_negative_boxes=head_objectness_iou_threshold_negative_boxes,
+            detector_background_iou_threshold_background=head_detector_background_iou_threshold_background,
             xywh_format=head_xywh_format,
             background_label_id=background_label_id
             )
@@ -90,12 +95,23 @@ class SwinTransformerDetection(torch.nn.Module):
             self.OD_head.load_state_dict(torch.load(head_weights_path))
             print(f"Head weights loaded from {head_weights_path}")
         else:
-            self.OD_head.apply(initialize_weights_FasterRCNN)
+            if head_rpn_weight_path:
+                self.OD_head.rpn.load_state_dict(torch.load(head_rpn_weight_path))
+                print(f"RPN head weights loaded from {head_rpn_weight_path}")
+            else:
+                self.OD_head.rpn.apply(initialize_weights_FasterRCNN_rpn)
 
-    def forward_train(self, input, BoundingBoxes, labels, rpn_training_only:bool=False, λ_detector_reg = 10, λ_rpn_reg = 0.25):
+            if head_detector_weight_path:
+                self.OD_head.detector.load_state_dict(torch.load(head_detector_weight_path))
+                print(f"Detector head weights loaded from {head_detector_weight_path}")
+            else:
+                self.OD_head.detector.apply(initialize_weights_FasterRCNN_detector)
+        
+
+    def forward_train(self, input, BoundingBoxes, labels, rpn_training_only:bool=False, λ_detector_reg = 10, λ_rpn_reg = 0.25, head_rpn_ratio_negative_to_positive_anchors: int = 3, head_detector_ratio_background_to_foreground_proposals: int = 3):
 
         x = self.backbone(input)
-        return self.OD_head.forward_train(x, BoundingBoxes, labels, rpn_training_only=rpn_training_only, λ_detector_reg = λ_detector_reg, λ_rpn_reg = λ_rpn_reg)
+        return self.OD_head.forward_train(x, BoundingBoxes, labels, rpn_training_only=rpn_training_only, λ_detector_reg = λ_detector_reg, λ_rpn_reg = λ_rpn_reg, rpn_ratio_negative_to_positive_anchors=head_rpn_ratio_negative_to_positive_anchors, detector_ratio_background_to_foreground_proposals=head_detector_ratio_background_to_foreground_proposals)
 
     def forward(self, input):
 

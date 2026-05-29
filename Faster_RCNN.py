@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torchvision.ops as ops
 import math
-from utils import loss_RPN, clip_bb_and_transform
+from utils import loss_RPN, clip_bb_and_transform, retrieve_proposals
 from Fast_RCNN import FastRCNN
 
 class RPN(nn.Module):
@@ -152,12 +152,13 @@ class RPN(nn.Module):
 
 
 class Faster_RCNN(nn.Module):
-    def __init__(self, in_channels: int, hidden_dim:int, n_class: int, scales: List[int], shapes: List[List[int]],  fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, objectness_iou_threshold_positive_boxes: float = 0.7, objectness_iou_threshold_negative_boxes: float = 0.3, xywh_format: bool = False, background_label_id: int = 0):
+    def __init__(self, in_channels: int, hidden_dim:int, n_class: int, scales: List[int], shapes: List[List[int]],  fixed_shape: Optional[Tuple[int, int, Tuple[int, int]]] = None, rpn_objectness_iou_threshold_positive_boxes: float = 0.7, rpn_objectness_iou_threshold_negative_boxes: float = 0.3, detector_background_iou_threshold_background: float = 0.3, xywh_format: bool = False, background_label_id: int = 0):
         super(Faster_RCNN, self).__init__()
 
         self.background_label_id = background_label_id
-        self.objectness_iou_threshold_positive_boxes = objectness_iou_threshold_positive_boxes
-        self.objectness_iou_threshold_negative_boxes = objectness_iou_threshold_negative_boxes
+        self.rpn_objectness_iou_threshold_positive_boxes = rpn_objectness_iou_threshold_positive_boxes
+        self.rpn_objectness_iou_threshold_negative_boxes = rpn_objectness_iou_threshold_negative_boxes
+        self.detector_background_iou_threshold_background = detector_background_iou_threshold_background
         self.xywh_format = xywh_format
 
         if fixed_shape is None:
@@ -211,7 +212,7 @@ class Faster_RCNN(nn.Module):
         return class_logits, bbox_deltas_map, ROIs
 
 
-    def forward_train(self, feature_map, GT_BB, labels, upscale_factor=None, rpn_training_only:bool=False, λ_detector_reg = 10, λ_rpn_reg = 0.25):
+    def forward_train(self, feature_map, GT_BB, labels, upscale_factor=None, rpn_training_only:bool=False, λ_detector_reg = 10, λ_rpn_reg = 0.25, rpn_ratio_negative_to_positive_anchors: int = 3, detector_ratio_background_to_foreground_proposals: int = 3):
 
         dict_losses = {}
 
@@ -230,11 +231,14 @@ class Faster_RCNN(nn.Module):
 
         # RPN part : create relevant proposals from the feature maps
         preds = self.rpn.forward(feature_map, upscale_factor, train=True)
-        loss_rpn, positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.objectness_iou_threshold_negative_boxes, λ_rpn_reg=λ_rpn_reg, dict_losses=dict_losses)
+        loss_rpn, proposal, objectness_score_map  = loss_RPN(preds, GT_BB, labels, self.bbox_normalize_stds, objectness_iou_threshold_positive=self.rpn_objectness_iou_threshold_positive_boxes, objectness_iou_threshold_negative=self.rpn_objectness_iou_threshold_negative_boxes, λ_rpn_reg=λ_rpn_reg, dict_losses=dict_losses, rpn_ratio_negative_to_positive_anchors=rpn_ratio_negative_to_positive_anchors)
 
         if rpn_training_only:
             return loss_rpn, None, None, None, None, dict_losses
         
+        # Even if the proposal has a anchors overlapping with a GT box, the RPN proposal can be negative if RPN deltas have made the boxes shifted so we need to re-assign the labels
+        positive_proposals, negative_proposals, aligned_positive_proposals_GT_BB, aligned_positive_proposals_GT_labels = retrieve_proposals(proposal, objectness_score_map, GT_BB, labels, self.detector_background_iou_threshold_background, detector_ratio_background_to_foreground_proposals, device=feature_map.device)
+
         # Proposal part:
         mixed_proposals = []
         aligned_GT_labels_list = []
@@ -360,7 +364,7 @@ class Faster_RCNN(nn.Module):
         loss = loss_rpn + loss_detector
 
         #print("Final model loss:", loss.item())
-        return loss, confidence_score, pos_ROIs, final_boxes, indice_class_selected, dict_losses
+        return loss, confidence_score, pos_ROIs, final_boxes, indice_class_selected, dict_losses, aligned_GT_BB, aligned_GT_labels_pos
     
 
     def roi_and_forward_detector_inference(self, roi_pool, upscale_factor, batch_size, h, w,feature_map, objectness_prob_map, proposals):
@@ -372,7 +376,7 @@ class Faster_RCNN(nn.Module):
         for image in range(batch_size):
 
             # only keep positive bounding boxes
-            mask_positive_boxes = objectness_prob_map[image] > self.objectness_iou_threshold_positive_boxes                
+            mask_positive_boxes = objectness_prob_map[image] > self.rpn_objectness_iou_threshold_positive_boxes                
             positive_boxes_objectness_map = objectness_prob_map[image][mask_positive_boxes]
             positive_proposals = proposals[image][mask_positive_boxes]
 
@@ -491,7 +495,7 @@ class Faster_RCNN(nn.Module):
         # TODO : remove this part
         list_anchors_boxes = []
         for i in range(B):
-            anc_boxes = anchor_boxes[objectness_prob_map[i] > self.objectness_iou_threshold_positive_boxes]
+            anc_boxes = anchor_boxes[objectness_prob_map[i] > self.rpn_objectness_iou_threshold_positive_boxes]
             if list_indices[i] is not None:
                 anc_boxes = anc_boxes[list_indices[i]]
             anc_boxes = anc_boxes[list_keep_indices[i]]
@@ -544,6 +548,47 @@ class Faster_RCNN(nn.Module):
             new_ROIs.append(ROI[mask])
 
         return confidence_score, new_ROIs, final_boxes, indice_class_selected
+    
+
+    @staticmethod
+    def postprocess_nms_per_class(iou_threshold, confidence_score, ROIs, final_boxes, indice_class_selected, xywh_format=False):
+        """ Apply Non-Maximum Suppression (NMS) per class, and per image """
+        split_sizes = [len(ROI) for ROI in ROIs]
+
+        pred_boxes = torch.split(final_boxes, split_sizes, dim=0)
+        labels = torch.split(indice_class_selected, split_sizes, dim=0)
+        confidence_scores = torch.split(confidence_score, split_sizes, dim=0)
+
+        new_confidence_score = []
+        new_ROIs = []
+        new_final_boxes = []
+        new_indice_class_selected = []
+
+        for boxes_img, scores_img, labels_img, roi_img in zip(pred_boxes, confidence_scores, labels, ROIs):
+            if boxes_img.size(0) == 0:
+                new_confidence_score.append(scores_img)
+                new_ROIs.append(roi_img)
+                new_final_boxes.append(boxes_img)
+                new_indice_class_selected.append(labels_img)
+                continue
+
+            if xywh_format:
+                x_min, y_min, w, h = boxes_img[:, 0], boxes_img[:, 1], boxes_img[:, 2], boxes_img[:, 3]
+            else:
+                y_min, x_min, h, w = boxes_img[:, 0], boxes_img[:, 1], boxes_img[:, 2], boxes_img[:, 3]
+            
+            x_max = x_min + w
+            y_max = y_min + h
+            boxes_nms = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+            keep_indices = ops.batched_nms(boxes_nms.float(), scores_img.float(), labels_img, iou_threshold)
+
+            new_confidence_score.append(scores_img[keep_indices])
+            new_ROIs.append(roi_img[keep_indices])
+            new_final_boxes.append(boxes_img[keep_indices])
+            new_indice_class_selected.append(labels_img[keep_indices])
+
+        return torch.cat(new_confidence_score, dim=0), new_ROIs, torch.cat(new_final_boxes, dim=0), torch.cat(new_indice_class_selected, dim=0)
     
 
     @staticmethod

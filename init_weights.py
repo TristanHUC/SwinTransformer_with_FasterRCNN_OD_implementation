@@ -47,9 +47,8 @@ def initialize_weights_Swin(module):
         nn.init.constant_(module.bias, 0)
 
 
-def initialize_weights_FasterRCNN(module):
+def initialize_weights_FasterRCNN_rpn(module):
     pi = 0.33 # with downsampling, the positive/negative ratio is around 1:3
-
     # RPN initialization
     if isinstance(module, RPN):
         nn.init.kaiming_normal_(module.rpn_conv.weight, mode='fan_in', nonlinearity='relu')
@@ -63,8 +62,9 @@ def initialize_weights_FasterRCNN(module):
             nn.init.constant_(module.rpn_bbox_pred.bias, 0)
 
 
+def initialize_weights_FasterRCNN_detector(module):
     # FastRCNN initialization
-    elif isinstance(module, FastRCNN):
+    if isinstance(module, FastRCNN):
         nn.init.kaiming_normal_(module.fc1.weight, mode='fan_in', nonlinearity='relu')
         if module.fc1.bias is not None:
             nn.init.constant_(module.fc1.bias, 0)

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 from Swin_V2 import SwinTransformer
-from init_weights import initialize_weights_Swin, initialize_weights_FasterRCNN
+from init_weights import initialize_weights_Swin
 
 
 class SwinTransformerClassification(torch.nn.Module):
